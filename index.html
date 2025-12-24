@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Neon Cyberpunk Particles</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: sans-serif;
+            color: white;
+        }
+
+        #canvas-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 1;
+        }
+
+        #video-container {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+            width: 160px;
+            height: 120px;
+            z-index: 2;
+            opacity: 0.5;
+            border: 1px solid #333;
+            transform: scaleX(-1);
+            /* Mirror preview */
+        }
+
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        #loading {
+            position: absolute;
+            top: 60%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #0ff;
+            font-size: 18px;
+            pointer-events: none;
+            z-index: 10;
+            text-align: center;
+            display: none;
+        }
+
+        #instructions {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: rgba(0, 255, 255, 0.7);
+            font-size: 16px;
+            z-index: 10;
+            pointer-events: none;
+            line-height: 1.5;
+        }
+
+        #start-screen {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: rgba(0, 0, 0, 0.9);
+            z-index: 100;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            color: #0ff;
+        }
+
+        #start-btn {
+            margin-top: 20px;
+            padding: 15px 40px;
+            font-size: 24px;
+            background: transparent;
+            border: 2px solid #0ff;
+            color: #0ff;
+            cursor: pointer;
+            border-radius: 5px;
+            box-shadow: 0 0 10px #0ff;
+            transition: all 0.3s;
+        }
+
+        #start-btn:hover {
+            background: #0ff;
+            color: #000;
+            box-shadow: 0 0 20px #0ff;
+        }
+    </style>
+    <!-- MediaPipe dependencies -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"
+        crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"
+        crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+
+<body>
+    <div id="start-screen">
+        <h1>NEON PARTICLES</h1>
+        <p>Для погружения требуется доступ к камере</p>
+        <button id="start-btn">НАЧАТЬ</button>
+    </div>
+
+    <div id="loading">Инициализация Камеры...</div>
+    <div id="instructions">
+        Покажите руку для взаимодействия.<br>
+        Открытая ладонь: Притяжение и Вращение<br>
+        Сжатие (Кулак): Гравитационная Сингулярность
+    </div>
+    <div id="canvas-container"></div>
+    <div id="video-container">
+        <!-- Added playsinline for mobile support -->
+        <video class="input_video" playsinline></video>
+    </div>
+
+    <!-- Import map for Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+        // --- Configuration ---
+        const PARTICLE_COUNT = 30000;
+        const CAM_FOV = 75;
+        const CAM_Z = 120;
+
+        // Colors
+        const COLOR_IDLE = new THREE.Color(0x8a2be2); // Violet
+        const COLOR_ACTIVE = new THREE.Color(0x9932cc); // DarkOrchid 
+        const COLOR_SINGULARITY = new THREE.Color(0x00ffff); // Cyan/Aqua
+
+        // --- Globals ---
+        let scene, camera, renderer, composer;
+        let particles, geometry;
+        let positions, velocities, colors;
+        let phis, thetas, radiuses; // Spherical coords storage
+        let time = 0;
+
+        // Hand State
+        let handPresent = false;
+        let handPosition = new THREE.Vector3(0, 0, 0);
+        let handRotationMatrix = new THREE.Matrix4();
+        let isPinching = false;
+        let pinchStrength = 0;
+        let handSpread = 0;
+        let videoElement; // Global video ref
+
+        // --- Shaders ---
+        const vertexShader = `
+            attribute float size;
+            attribute vec3 customColor;
+            varying vec3 vColor;
+            void main() {
+                vColor = customColor;
+                vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                gl_PointSize = size * (300.0 / -mvPosition.z);
+                gl_Position = projectionMatrix * mvPosition;
+            }
+        `;
+
+        const fragmentShader = `
+            varying vec3 vColor;
+            void main() {
+                vec2 center = gl_PointCoord - 0.5;
+                float dist = length(center);
+                if (dist > 0.5) discard;
+                float alpha = 1.0 - smoothstep(0.3, 0.5, dist);
+                gl_FragColor = vec4(vColor, alpha);
+            }
+        `;
+
+
+
+        function init() {
+            // Scene Setup
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000000, 0.002);
+
+            camera = new THREE.PerspectiveCamera(CAM_FOV, window.innerWidth / window.innerHeight, 1, 1000);
+            camera.position.z = CAM_Z;
+
+            renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+            const renderScene = new RenderPass(scene, camera);
+            const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+            bloomPass.threshold = 0;
+            bloomPass.strength = 1.2;
+            bloomPass.radius = 0.5;
+
+            composer = new EffectComposer(renderer);
+            composer.addPass(renderScene);
+            composer.addPass(bloomPass);
+
+            initParticles();
+            window.addEventListener('resize', onWindowResize);
+
+            // Wait for user to click button
+            document.getElementById('start-btn').addEventListener('click', () => {
+                const screen = document.getElementById('start-screen');
+                screen.innerHTML = '<h1>Инициализация...</h1><p>Запрос доступа к камере...</p>';
+                initMediaPipe();
+            });
+
+            animate();
+        }
+
+        function initParticles() {
+            geometry = new THREE.BufferGeometry();
+            positions = new Float32Array(PARTICLE_COUNT * 3);
+            velocities = new Float32Array(PARTICLE_COUNT * 3);
+            colors = new Float32Array(PARTICLE_COUNT * 3);
+            const sizes = new Float32Array(PARTICLE_COUNT);
+
+            phis = new Float32Array(PARTICLE_COUNT);
+            thetas = new Float32Array(PARTICLE_COUNT);
+            radiuses = new Float32Array(PARTICLE_COUNT);
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const u = Math.random();
+                const v = Math.random();
+                const theta = 2 * Math.PI * u;
+                const phi = Math.acos(2 * v - 1);
+
+                phis[i] = phi;
+                thetas[i] = theta;
+                radiuses[i] = 1.0 + (Math.random() * 0.4 - 0.2);
+
+                const r = 40 * radiuses[i];
+                const x = r * Math.sin(phi) * Math.cos(theta);
+                const y = r * Math.sin(phi) * Math.sin(theta);
+                const z = r * Math.cos(phi);
+
+                positions[i * 3] = x;
+                positions[i * 3 + 1] = y;
+                positions[i * 3 + 2] = z;
+
+                colors[i * 3] = COLOR_IDLE.r;
+                colors[i * 3 + 1] = COLOR_IDLE.g;
+                colors[i * 3 + 2] = COLOR_IDLE.b;
+
+                sizes[i] = 1.0 + Math.random() * 2.0;
+            }
+
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('customColor', new THREE.BufferAttribute(colors, 3));
+            geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+            const material = new THREE.ShaderMaterial({
+                uniforms: {},
+                vertexShader: vertexShader,
+                fragmentShader: fragmentShader,
+                blending: THREE.AdditiveBlending,
+                depthTest: false,
+                transparent: true,
+                vertexColors: true
+            });
+
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+        }
+
+        async function initMediaPipe() {
+            videoElement = document.getElementsByClassName('input_video')[0];
+            const startScreen = document.getElementById('start-screen');
+            // loadingElement is reused inside startScreen for messages now
+
+            videoElement.setAttribute('playsinline', '');
+
+            function onResults(results) {
+                // If we get results, hide all overlays
+                startScreen.style.display = 'none';
+                document.getElementById('loading').style.display = 'none';
+
+                if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                    handPresent = true;
+                    const landmarks = results.multiHandLandmarks[0];
+                    const palm = landmarks[9];
+
+                    const ndcX = (1 - palm.x) * 2 - 1;
+                    const ndcY = -(palm.y * 2 - 1);
+
+                    const distToCam = camera.position.z;
+                    const vFOV = THREE.MathUtils.degToRad(camera.fov);
+                    const heightAtZero = 2 * Math.tan(vFOV / 2) * distToCam;
+                    const widthAtZero = heightAtZero * camera.aspect;
+
+                    const x = ndcX * (widthAtZero / 2);
+                    const y = ndcY * (heightAtZero / 2);
+                    const target = new THREE.Vector3(x, y, 0);
+
+                    // Smooth hand movement
+                    handPosition.lerp(target, 0.2);
+
+                    // --- Rotation Calculation ---
+                    const pWrist = landmarks[0];
+                    const pMiddle = landmarks[9];
+                    const pIndex = landmarks[5];
+                    const pPinky = landmarks[17];
+
+                    const vY = new THREE.Vector3(
+                        (1 - pMiddle.x) - (1 - pWrist.x),
+                        -(pMiddle.y - pWrist.y),
+                        (pMiddle.z - pWrist.z) * 2.0
+                    ).normalize();
+
+                    const vX = new THREE.Vector3(
+                        (1 - pPinky.x) - (1 - pIndex.x),
+                        -(pPinky.y - pIndex.y),
+                        (pPinky.z - pIndex.z) * 2.0
+                    ).normalize();
+
+                    const vZ = new THREE.Vector3().crossVectors(vX, vY).normalize();
+                    const vXfinal = new THREE.Vector3().crossVectors(vY, vZ).normalize();
+
+                    handRotationMatrix.makeBasis(vXfinal, vY, vZ);
+
+                    // --- Pinch Detection (Hysteresis) ---
+                    const thumb = landmarks[4];
+                    const index = landmarks[8];
+                    const dx = thumb.x - index.x;
+                    const dy = thumb.y - index.y;
+                    const dist = Math.sqrt(dx * dx + dy * dy);
+
+                    if (isPinching) {
+                        if (dist > 0.12) isPinching = false;
+                    } else {
+                        if (dist < 0.08) isPinching = true;
+                    }
+
+                    if (isPinching) {
+                        pinchStrength = Math.min(pinchStrength + 0.1, 1.0);
+                    } else {
+                        pinchStrength = Math.max(pinchStrength - 0.1, 0.0);
+                    }
+
+                    // --- Spread Detection ---
+                    let totalDist = 0;
+                    const tips = [4, 8, 12, 16, 20];
+                    tips.forEach(idx => {
+                        const t = landmarks[idx];
+                        const d = Math.sqrt(
+                            Math.pow(t.x - palm.x, 2) + Math.pow(t.y - palm.y, 2)
+                        );
+                        totalDist += d;
+                    });
+                    const avgDist = totalDist / 5.0;
+
+                    const clampedDist = Math.max(0.05, Math.min(avgDist, 0.25));
+                    const newSpread = (clampedDist - 0.05) / (0.20);
+                    handSpread = handSpread * 0.8 + newSpread * 0.2;
+
+                } else {
+                    handPresent = false;
+                    isPinching = false;
+                    pinchStrength = Math.max(pinchStrength - 0.05, 0.0);
+                }
+            }
+
+            const hands = new Hands({
+                locateFile: (file) => {
+                    return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+                }
+            });
+
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 1,
+                minDetectionConfidence: 0.5,
+                minTrackingConfidence: 0.5
+            });
+
+            hands.onResults(onResults);
+
+            // --- Diagnostics ---
+            async function checkPermissions() {
+                try {
+                    const status = await navigator.permissions.query({ name: 'camera' });
+                    return status.state; // 'granted', 'denied', or 'prompt'
+                } catch (e) {
+                    return 'unknown';
+                }
+            }
+
+            async function startCamera() {
+                // 1. Secure Context Check (HTTP Workaround Guide)
+                if (!window.isSecureContext && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+                    const extraHelp = `
+                        <div style="background: #330000; border: 1px solid red; padding: 10px; margin-top: 15px; border-radius: 5px; font-size: 14px; text-align: left;">
+                            <strong>⚠️ Внимание: Вы используете HTTP (значок "i")</strong><br>
+                            Android блокирует камеру на незащищенных сайтах.<br><br>
+                            <b>Решение (Гайд):</b><br>
+                            1. Откройте в новой вкладке: <code style="background:#000; color: #0f0; padding: 2px;">chrome://flags</code><br>
+                            2. Найдите: <b>unsafely-treat-insecure-origin-as-secure</b><br>
+                            3. Включите его (Enabled).<br>
+                            4. В поле ввода добавьте IP (ниже) и нажмите Relaunch.<br>
+                            <br>
+                            Ваш адрес: <code style="background:#000; color: #0f0; padding: 2px;">${location.origin}</code>
+                        </div>
+                    `;
+                    showError("HTTPS REQUIRED", "Камера работает только по безопасному соединению (HTTPS).<br>" + extraHelp);
+                    return;
+                }
+
+                // 2. Permission Diagnostic
+                const permState = await checkPermissions();
+                console.log("Permission State:", permState);
+                if (permState === 'denied') {
+                    showError("ДОСТУП ЗАПРЕЩЕН",
+                        "Браузер помнит запрет. Если значка 'Замок' нет, значит проблема в HTTP.<br>" +
+                        "<br><hr style='border:0; border-top:1px solid #555; margin:10px 0'><br>" +
+                        "<b>Или сбросьте настройки:</b><br>Нажмите значок 'i' или 'Настройки' в строке адреса -> Настройки сайта -> Сбросить."
+                    );
+                    return;
+                }
+
+                // 3. Attempts
+                try {
+                    // Attempt 1: Ideal Mobile Config
+                    await tryGetUserMedia({
+                        video: {
+                            facingMode: 'user',
+                            width: { ideal: 1280 },
+                            height: { ideal: 720 }
+                        }
+                    });
+                } catch (e1) {
+                    console.warn("Attempt 1 failed, trying fallback...", e1);
+                    try {
+                        // Attempt 2: Basic Config (Highest Chance of Success)
+                        await tryGetUserMedia({ video: true });
+                    } catch (e2) {
+                        console.error("All attempts failed", e2);
+                        let msg = "Не удалось запустить камеру.";
+                        if (e2.name === 'NotAllowedError' || e2.name === 'PermissionDeniedError') {
+                            msg = "Вы отклонили доступ (или он заблокирован).<br>Сбросьте разрешения сайта в браузере (значок замка 🔒).";
+                        } else if (e2.name === 'NotFoundError') {
+                            msg = "Камера не найдена на устройстве.";
+                        } else if (e2.name === 'NotReadableError') {
+                            msg = "Камера занята другим приложением.";
+                        } else {
+                            msg += "<br>" + e2.name;
+                        }
+                        showError("ОШИБКА КАМЕРЫ", msg);
+                    }
+                }
+            }
+
+
+            async function tryGetUserMedia(constraints) {
+                const stream = await navigator.mediaDevices.getUserMedia(constraints);
+                videoElement.srcObject = stream;
+                await videoElement.play();
+                processVideo();
+            }
+
+            function showError(title, msg) {
+                startScreen.style.display = 'flex';
+                startScreen.innerHTML = `
+                    <h1 style="color:red">${title}</h1>
+                    <p style="text-align:center; max-width: 80%;">${msg}</p>
+                    <button id="retry-btn" style="
+                        margin-top: 20px; padding: 10px 30px; 
+                        background: #333; color: white; border: 1px solid white;
+                        font-size: 18px; cursor: pointer;">
+                        Попробовать снова
+                    </button>
+                    <p style="font-size:12px; opacity:0.7; margin-top:20px;">Debug: ${navigator.userAgent}</p>
+                `;
+                document.getElementById('retry-btn').addEventListener('click', () => {
+                    location.reload();
+                });
+            }
+
+            async function processVideo() {
+                if (videoElement.readyState >= 2) {
+                    await hands.send({ image: videoElement });
+                }
+                requestAnimationFrame(processVideo);
+            }
+
+            startCamera();
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            time += 0.01;
+
+            const positionAttribute = geometry.attributes.position;
+            const colorAttribute = geometry.attributes.customColor;
+
+            // 1. Reduced Radius & Pulse
+            let currentRadius = 35 + Math.sin(time * 1.5) * 5;
+            let rotationSpeed = 0.2;
+
+            // 2. Interaction
+            let targetCenter = new THREE.Vector3(0, 0, 0);
+            const tempVec = new THREE.Vector3();
+
+            if (handPresent) {
+                targetCenter.copy(handPosition);
+
+                // SIZE CONTROL via Hand Spread
+                let spreadRadius = 15.0 + (handSpread * 45.0);
+                currentRadius = spreadRadius;
+
+                if (pinchStrength > 0.01) {
+                    const MIN_RADIUS = 12.0;
+                    const collapseFactor = Math.pow(pinchStrength, 3);
+                    currentRadius = currentRadius * (1.0 - collapseFactor) + MIN_RADIUS * collapseFactor;
+
+                    rotationSpeed += pinchStrength * 15.0;
+                } else {
+                    rotationSpeed = 0.0;
+                }
+            }
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const ix = i * 3;
+                let px = positions[ix];
+                let py = positions[ix + 1];
+                let pz = positions[ix + 2];
+                let vx = velocities[ix];
+                let vy = velocities[ix + 1];
+                let vz = velocities[ix + 2];
+
+                let theta = thetas[i];
+                let phi = phis[i];
+
+                if (!handPresent) {
+                    theta += time * rotationSpeed + (i * 0.0001);
+                } else {
+                    if (pinchStrength > 0.1) {
+                        theta += time * rotationSpeed;
+                    }
+                }
+
+                const r = currentRadius * radiuses[i];
+
+                let lx = r * Math.sin(phi) * Math.cos(theta);
+                let ly = r * Math.sin(phi) * Math.sin(theta);
+                let lz = r * Math.cos(phi);
+
+                if (handPresent) {
+                    tempVec.set(lx, ly, lz);
+                    tempVec.applyMatrix4(handRotationMatrix);
+                    lx = tempVec.x;
+                    ly = tempVec.y;
+                    lz = tempVec.z;
+                }
+
+                let tx = lx + targetCenter.x;
+                let ty = ly + targetCenter.y;
+                let tz = lz + targetCenter.z;
+
+                const stiffness = 0.08 + (pinchStrength * 0.3);
+                const dx = tx - px;
+                const dy = ty - py;
+                const dz = tz - pz;
+
+                vx += dx * stiffness;
+                vy += dy * stiffness;
+                vz += dz * stiffness;
+
+                const noiseAmt = 0.05 + (pinchStrength * 0.3);
+                vx += (Math.random() - 0.5) * noiseAmt;
+                vy += (Math.random() - 0.5) * noiseAmt;
+                vz += (Math.random() - 0.5) * noiseAmt;
+
+                vx *= 0.82;
+                vy *= 0.82;
+                vz *= 0.82;
+
+                px += vx;
+                py += vy;
+                pz += vz;
+
+                positions[ix] = px;
+                positions[ix + 1] = py;
+                positions[ix + 2] = pz;
+
+                velocities[ix] = vx;
+                velocities[ix + 1] = vy;
+                velocities[ix + 2] = vz;
+
+                // COLORING
+                // t = pinch fraction 0..1
+                const t = Math.min(pinchStrength * 1.5, 1.0);
+
+                // Brightness
+                const intensity = 1.0 - (t * 0.6);
+
+                const rCol = COLOR_IDLE.r * (1.0 - t) + COLOR_SINGULARITY.r * t;
+                const gCol = COLOR_IDLE.g * (1.0 - t) + COLOR_SINGULARITY.g * t;
+                const bCol = COLOR_IDLE.b * (1.0 - t) + COLOR_SINGULARITY.b * t;
+
+                const speed = Math.sqrt(vx * vx + vy * vy + vz * vz);
+                const bright = Math.min(speed * 0.02, 0.1);
+
+                colors[ix] = (rCol + bright) * intensity;
+                colors[ix + 1] = (gCol + bright) * intensity;
+                colors[ix + 2] = (bCol + bright) * intensity;
+            }
+
+            positionAttribute.needsUpdate = true;
+            colorAttribute.needsUpdate = true;
+
+            composer.render();
+        }
+
+        init();
+
+    </script>
+</body>
+
+</html>
